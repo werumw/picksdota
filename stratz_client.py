@@ -174,7 +174,6 @@ class StratzClient:
         player = data.get("player") or {}
         raw_matches = player.get("matches") or []
 
-        # Преобразуем в плоский удобный формат для анализа
         results = []
         for m in raw_matches:
             p = next((x for x in m.get("players", []) if x.get("steamAccountId") == steam_account_id), None)
@@ -190,13 +189,14 @@ class StratzClient:
                 })
         return results
 
-    def get_live_matches(self) -> List[Dict[str, Any]]:
-        """Получает список текущих live матчей."""
+    def get_live_matches(self, take: int = 50) -> List[Dict[str, Any]]:
+        """Получает расширенный список текущих live матчей (до 50 матчей)."""
         gql = """
-        query GetLiveMatches {
+        query GetLiveMatches($take: Int!) {
           live {
-            matches(request: { take: 10 }) {
+            matches(request: { take: $take }) {
               matchId
+              gameState
               radiantTeam {
                 name
                 tag
@@ -216,6 +216,29 @@ class StratzClient:
           }
         }
         """
-        data = self.query(gql)
-        live = data.get("live") or {}
-        return live.get("matches") or []
+        try:
+            data = self.query(gql, {"take": take})
+            live = data.get("live") or {}
+            return live.get("matches") or []
+        except Exception:
+            # Fallback к базовому запросу, если аргумент take не поддерживается
+            gql_base = """
+            query GetLiveMatches {
+              live {
+                matches {
+                  matchId
+                  gameState
+                  radiantTeam { name tag }
+                  direTeam { name tag }
+                  gameTime
+                  players { steamAccountId heroId isRadiant networth }
+                }
+              }
+            }
+            """
+            try:
+                data = self.query(gql_base)
+                live = data.get("live") or {}
+                return live.get("matches") or []
+            except Exception:
+                return []
