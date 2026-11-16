@@ -1,51 +1,90 @@
 import os
-import asyncio
+import json
 import logging
-import time
+import asyncio
+from pathlib import Path
 from typing import Dict, Any, List
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    CallbackQuery
+)
 from aiogram.client.session.aiohttp import AiohttpSession
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_PROXY, STRATZ_API_KEY
+from subscriber_manager import add_subscriber, remove_subscriber, is_subscribed, get_subscribers
 from stratz_client import StratzClient
+from schedule_fetcher import LiquipediaScheduleFetcher
+from live_tracker import LiveMatchTracker
 from dossier_builder import MatchDossierBuilder
 from ai_analyzer import DotaAIAnalyzer
-from test_runner import SAMPLE_PRO_MATCH
-from subscriber_manager import get_subscribers, add_subscriber, remove_subscriber, is_subscribed
-from schedule_fetcher import LiquipediaScheduleFetcher
 from odds_calculator import OddsCalculator
 from post_match_tracker import PostMatchTracker
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("DotaTelegramBot")
 
 post_tracker = PostMatchTracker()
 
-# Веб-сервер для поддержки активности на облачных хостингах
+# In-memory stores
+HANDLED_MATCH_IDS = set()
+PENDING_DRAFT_MATCHES: Dict[int, Dict[str, Any]] = {}
+ACTIVE_LIVE_MATCHES: Dict[int, Dict[str, Any]] = {}
+
+SAMPLE_PRO_MATCH = {
+    "id": 9088923051,
+    "radiantTeam": {"name": "Team Spirit"},
+    "direTeam": {"name": "Team Liquid"},
+    "radiantScore": 34,
+    "direScore": 21,
+    "durationSeconds": 2480,
+    "players": [
+        {"steamAccountId": 172099728, "heroId": 53, "role": 1, "lane": 1, "kills": 9, "deaths": 2, "assists": 14, "isRadiant": True, "steamAccount": {"name": "Kiritych~", "proSteamAccount": {"name": "Kiritych"}}},
+        {"steamAccountId": 858106446, "heroId": 107, "role": 2, "lane": 2, "kills": 12, "deaths": 4, "assists": 11, "isRadiant": True, "steamAccount": {"name": "kiyotaka", "proSteamAccount": {"name": "kiyotaka"}}},
+        {"steamAccountId": 165564598, "heroId": 78, "role": 3, "lane": 3, "kills": 5, "deaths": 3, "assists": 18, "isRadiant": True, "steamAccount": {"name": "MieRo", "proSteamAccount": {"name": "MieRo"}}},
+        {"steamAccountId": 317880638, "heroId": 86, "role": 4, "lane": 3, "kills": 4, "deaths": 6, "assists": 22, "isRadiant": True, "steamAccount": {"name": "Save-", "proSteamAccount": {"name": "Save-"}}},
+        {"steamAccountId": 196878136, "heroId": 50, "role": 5, "lane": 1, "kills": 4, "deaths": 6, "assists": 20, "isRadiant": True, "steamAccount": {"name": "Kataomi`", "proSteamAccount": {"name": "Kataomi`"}}},
+        {"steamAccountId": 124801757, "heroId": 1, "role": 1, "lane": 1, "kills": 6, "deaths": 6, "assists": 7, "isRadiant": False, "steamAccount": {"name": "miCKe", "proSteamAccount": {"name": "miCKe"}}},
+        {"steamAccountId": 152962063, "heroId": 22, "role": 2, "lane": 2, "kills": 7, "deaths": 7, "assists": 9, "isRadiant": False, "steamAccount": {"name": "Nisha", "proSteamAccount": {"name": "Nisha"}}},
+        {"steamAccountId": 86799324, "heroId": 98, "role": 3, "lane": 3, "kills": 3, "deaths": 8, "assists": 10, "isRadiant": False, "steamAccount": {"name": "33", "proSteamAccount": {"name": "33"}}},
+        {"steamAccountId": 89117038, "heroId": 87, "role": 4, "lane": 3, "kills": 2, "deaths": 7, "assists": 12, "isRadiant": False, "steamAccount": {"name": "Boxi", "proSteamAccount": {"name": "Boxi"}}},
+        {"steamAccountId": 10366616, "heroId": 64, "role": 5, "lane": 1, "kills": 3, "deaths": 6, "assists": 11, "isRadiant": False, "steamAccount": {"name": "Insania", "proSteamAccount": {"name": "Insania"}}}
+    ]
+}
+
 async def health_check_handler(request):
-    return web.Response(text="🟢 Dota 2 AI Bot with Live Odds & Post-Match Tracker is running 24/7!", content_type="text/plain")
+    return web.Response(text="OK - Dota 2 AI Bot Active (Paris / Alwaysdata)")
 
 async def start_health_server():
-    port = int(os.getenv("PORT", 7860))
+    port = int(os.environ.get("PORT", 8080))
     app = web.Application()
     app.router.add_get("/", health_check_handler)
-    app.router.add_get("/health", health_check_handler)
+    app.router.add_get("/healthz", health_check_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Вспомогательный веб-сервер запущен на порту {port}")
+    try:
+        await site.start()
+        logger.info(f"Health-check HTTP сервер слушает порт {port}")
+    except Exception as e:
+        logger.warning(f"Не удалось запустить HTTP сервер на {port}: {e}")
 
 def get_main_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    auto_active = is_subscribed(chat_id)
-    btn_auto_text = "🟢 Авто-уведомления: ВКЛ" if auto_active else "⚪ Авто-уведомления: ВЫКЛ"
+    is_sub = is_subscribed(chat_id)
+    btn_auto_text = "🔔 Авто-уведомления: ВКЛ" if is_sub else "🔕 Авто-уведомления: ВЫКЛ"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🎮 Тестовый анализ (Spirit vs Liquid)", callback_data="btn_test"),
-            InlineKeyboardButton(text="📅 Расписание турниров", callback_data="btn_schedule")
+            InlineKeyboardButton(text="📅 Расписание турниров", callback_data="btn_schedule"),
+            InlineKeyboardButton(text="⚡ Тестовый анализ", callback_data="btn_test")
         ],
         [
             InlineKeyboardButton(text="🔴 Проверить Live сейчас", callback_data="btn_live"),
@@ -54,7 +93,7 @@ def get_main_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     ])
     return kb
 
-def format_analysis_card(match_id: Any, res: Dict[str, Any], is_live: bool = False, rad_name: str = "Radiant", dire_name: str = "Dire") -> str:
+def format_analysis_card(match_id: Any, res: Dict[str, Any], is_live: bool = False, rad_name: str = "Radiant", dire_name: str = "Dire", tier: int = 1) -> str:
     winner = res.get("predicted_winner", "Unknown")
     winner_name = res.get("predicted_team_name", winner)
     prob = res.get("win_probability_percent", 50)
@@ -69,7 +108,8 @@ def format_analysis_card(match_id: Any, res: Dict[str, Any], is_live: bool = Fal
 
     loser_name = dire_name if winner == "Radiant" else rad_name
 
-    header = "🔴 <b>LIVE-ДРАФТ ЗАВЕРШЕН! АНАЛИЗ МАТЧА</b>" if is_live else "📊 <b>АНАЛИЗ МАТЧА DOTA 2</b>"
+    tier_badge = "🏆 [Tier 1]" if tier == 1 else ("🥈 [Tier 2]" if tier == 2 else "🥉 [Tier 3]")
+    header = f"🔴 <b>LIVE-ДРАФТ ЗАВЕРШЕН {tier_badge}!</b>" if is_live else "📊 <b>АНАЛИЗ МАТЧА DOTA 2</b>"
 
     lanes = res.get("lanes_breakdown", {})
     safe_lane = lanes.get("safe_radiant_vs_off_dire", "Равный матчап")
@@ -114,15 +154,18 @@ dp = Dispatcher()
 async def cmd_start(message: Message):
     add_subscriber(message.chat.id)
     text = (
-        "👋 <b>Привет! Я бот глубокого анализа матчей Dota 2.</b>\n\n"
+        "👋 <b>Привет! Я бот глубокого AI-анализа матчей Dota 2.</b>\n\n"
         "✅ <b>Вы успешно подписаны на уведомления!</b>\n\n"
-        "<b>Что делает бот:</b>\n"
-        "1. <b>До игры (в момент драфта):</b> присылает детальный скаутинг 10 игроков, вероятность победы и <b>коэффициенты букмекеров (+EV)</b>.\n"
-        "2. <b>После игры:</b> автоматически присылает <b>отчет с результатом (зашел прогноз или нет, и почему)</b>.\n\n"
+        "<b>Как работает система:</b>\n"
+        "1. 🏆 <b>Турниры Tier-1:</b> анализируются <b>полностью автоматически</b> сразу после стадии драфта.\n"
+        "2. 🥈🥉 <b>Турниры Tier-2 и Tier-3:</b> когда начнется их драфт, бот пришлет вам запрос с кнопкой <code>[🎯 Анализировать]</code> — вы сами решаете, разбирать матч или пропустить.\n"
+        "3. 💰 <b>Коэффициенты букмекеров:</b> расчет вероятностей, справедливого кэфа и +EV ставок.\n"
+        "4. 🏁 <b>Результат после игры:</b> по окончании матча бот пришлет отчет (зашел ли прогноз и тактический разбор, почему).\n\n"
         "<b>Команды:</b>\n"
-        "• Отправьте <b>номер любого матча</b> (например: <code>9088923051</code>) для разбора.\n"
-        "• <code>/schedule</code> — ближайшие турнирные игры по расписанию.\n"
-        "• <code>/test</code> — посмотреть пример отчета (Spirit vs Liquid)."
+        "• Отправьте <b>ID любого матча</b> (например: <code>9088923051</code>) для мгновенного разбора.\n"
+        "• <code>/schedule</code> — расписание матчей с разбивкой по Tier.\n"
+        "• <code>/live</code> — проверить текущие живые игры.\n"
+        "• <code>/test</code> — демонстрационный пример отчета."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard(message.chat.id))
 
@@ -142,10 +185,9 @@ async def handle_test(event: types.TelegramObject):
         res = await asyncio.to_thread(analyzer.analyze_dossier, dossier)
         card = format_analysis_card(
             SAMPLE_PRO_MATCH["id"], res, is_live=False,
-            rad_name="Team Spirit", dire_name="Team Liquid"
+            rad_name="Team Spirit", dire_name="Team Liquid", tier=1
         )
 
-        # Ставим на трекинг результата
         post_tracker.track_match(
             SAMPLE_PRO_MATCH["id"], "Team Spirit", "Team Liquid",
             res.get("predicted_team_name", "Team Spirit"), res.get("predicted_winner", "Radiant"),
@@ -165,22 +207,28 @@ async def handle_schedule(event: types.TelegramObject):
 
     add_subscriber(msg.chat.id)
     wait_msg = await msg.answer("📅 Загружаю официальное расписание Liquipedia...")
-    matches = await asyncio.to_thread(LiquipediaScheduleFetcher.get_upcoming_matches, 6)
+    matches = await asyncio.to_thread(LiquipediaScheduleFetcher.get_upcoming_matches, 8)
 
     if not matches:
         await wait_msg.edit_text("😴 На ближайшее время матчей в расписании не найдено.", reply_markup=get_main_keyboard(msg.chat.id))
         return
 
-    text = "📅 <b>БЛИЖАЙШИЕ МАТЧИ ПО РАСПИСАНИЮ (Liquipedia):</b>\n\n"
+    text = "📅 <b>БЛИЖАЙШИЕ МАТЧИ ПО РАСПИСАНИЮ:</b>\n\n"
     for idx, m in enumerate(matches, 1):
         mins = m["starts_in_minutes"]
         time_hint = f"через {int(mins)} мин" if mins > 0 else "прямо сейчас!"
+        tier_num = m.get("tier", 2)
+        tier_icon = "🏆 [Tier 1]" if tier_num == 1 else ("🥈 [Tier 2]" if tier_num == 2 else "🥉 [Tier 3]")
+
         text += (
-            f"<b>{idx}. {m['team1']} vs {m['team2']}</b>\n"
+            f"<b>{idx}. {tier_icon} {m['team1']} vs {m['team2']}</b>\n"
             f"🏆 Турнир: <i>{m['tournament']}</i>\n"
             f"🕒 Начало: <code>{m['datetime_utc']}</code> ({time_hint})\n\n"
         )
-    text += "💡 <i>Перед началом матча бот автоматически пришлет вам расклад драфта и коэффициенты, а после игры — результат!</i>"
+    text += (
+        "ℹ️ <i>Матчи <b>Tier 1</b> анализируются автоматически сразу при старте драфта.\n"
+        "Для матчей <b>Tier 2 и 3</b> бот пришлет интерактивный запрос, когда начнется их драфт.</i>"
+    )
     await wait_msg.edit_text(text, parse_mode="HTML", reply_markup=get_main_keyboard(msg.chat.id))
 
 @dp.message(Command("live"))
@@ -191,44 +239,122 @@ async def handle_live(event: types.TelegramObject):
         await event.answer("Проверяю live матчи...")
 
     add_subscriber(msg.chat.id)
+    wait_msg = await msg.answer("🔎 Сканирую live-серверы Dota 2...")
+
     try:
         stratz = StratzClient()
-        live = await asyncio.to_thread(stratz.get_live_matches, 50)
+        live = await asyncio.to_thread(LiveMatchTracker.get_live_matches, stratz)
+
         if not live:
-            await msg.answer("😴 Сейчас нет активных официальных матчей на стадии драфта.", reply_markup=get_main_keyboard(msg.chat.id))
+            await wait_msg.edit_text("😴 Сейчас нет активных официальных матчей на стадии драфта.", reply_markup=get_main_keyboard(msg.chat.id))
             return
 
-        text = f"🔴 <b>Найдено Live-матчей: {len(live)}</b>\n\n"
+        # Сохраняем в кэш
+        for m in live:
+            ACTIVE_LIVE_MATCHES[m["match_id"]] = m
+
+        tour_matches = [m for m in live if m["match_type"] == "tournament"]
+        pub_matches = [m for m in live if m["match_type"] != "tournament"]
+
+        text = f"🔴 <b>НАЙДЕНО LIVE-МАТЧЕЙ: {len(live)}</b>\n\n"
         buttons = []
-        for m in live[:6]:
-            mid = m.get("matchId")
-            rad = m.get("radiantTeam", {}).get("name", "Radiant")
-            dire = m.get("direTeam", {}).get("name", "Dire")
-            state = m.get("gameState", "LIVE")
-            text += f"• <b>{rad}</b> vs <b>{dire}</b> (ID: <code>{mid}</code>, Статус: {state})\n"
-            buttons.append([InlineKeyboardButton(text=f"Анализ {rad} vs {dire}", callback_data=f"analyze_{mid}")])
+
+        if tour_matches:
+            text += "🏆 <b>Официальные турнирные матчи:</b>\n"
+            for m in tour_matches[:5]:
+                mid = m["match_id"]
+                rad = m["radiant_name"]
+                dire = m["dire_name"]
+                p_cnt = m["picked_count"]
+                status = "✅ Драфт завершен" if m["draft_complete"] else f"⏳ Драфт ({p_cnt}/10)"
+                text += f"• <b>{rad}</b> vs <b>{dire}</b> (ID: <code>{mid}</code> | {status})\n"
+                buttons.append([InlineKeyboardButton(text=f"🎯 Анализ: {rad} vs {dire}", callback_data=f"analyze_{mid}")])
+            text += "\n"
+
+        if pub_matches and len(buttons) < 5:
+            text += "🔥 <b>Матчи Pro / High-MMR (Immortal):</b>\n"
+            for m in pub_matches[:(5 - len(buttons))]:
+                mid = m["match_id"]
+                rad = m["radiant_name"]
+                dire = m["dire_name"]
+                mmr = m.get("avg_mmr", 0)
+                text += f"• <b>{rad}</b> vs <b>{dire}</b> (ID: <code>{mid}</code>, MMR: ~{mmr})\n"
+                buttons.append([InlineKeyboardButton(text=f"🎯 Анализ: {rad} vs {dire}", callback_data=f"analyze_{mid}")])
 
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+        await wait_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка в handle_live: {e}")
+        await wait_msg.edit_text(f"❌ Ошибка получения Live: {e}")
 
-@dp.callback_query(F.data.startswith("analyze_"))
-async def cb_analyze_live(query: CallbackQuery):
-    match_id = int(query.data.split("_")[1])
-    await query.answer("Анализирую...")
-    wait_msg = await query.message.answer(f"⏳ Сбор данных для матча {match_id}...")
+@dp.callback_query(F.data.startswith("confirm_draft_"))
+async def cb_confirm_draft(query: CallbackQuery):
+    match_id = int(query.data.split("_")[2])
+    await query.answer("Запускаю анализ драфта...")
+    wait_msg = await query.message.answer(f"⏳ Сбор данных и расчет коэффициентов для матча <code>{match_id}</code>...")
+
     try:
+        # Проверяем кэш драфта
+        match_data = PENDING_DRAFT_MATCHES.get(match_id) or ACTIVE_LIVE_MATCHES.get(match_id)
         stratz = StratzClient()
-        match_data = await asyncio.to_thread(stratz.get_match, match_id)
-        rad_name = match_data.get("radiantTeam", {}).get("name", "Radiant")
-        dire_name = match_data.get("direTeam", {}).get("name", "Dire")
+
+        if not match_data:
+            match_data = await asyncio.to_thread(stratz.get_match, match_id)
+
+        rad_name = match_data.get("radiant_name") or match_data.get("radiantTeam", {}).get("name", "Radiant")
+        dire_name = match_data.get("dire_name") or match_data.get("direTeam", {}).get("name", "Dire")
 
         builder = MatchDossierBuilder(stratz_client=stratz)
         dossier = await asyncio.to_thread(builder.build_match_dossier, match_data)
         analyzer = DotaAIAnalyzer()
         res = await asyncio.to_thread(analyzer.analyze_dossier, dossier)
-        card = format_analysis_card(match_id, res, is_live=True, rad_name=rad_name, dire_name=dire_name)
+        card = format_analysis_card(match_id, res, is_live=True, rad_name=rad_name, dire_name=dire_name, tier=2)
+
+        post_tracker.track_match(
+            match_id, rad_name, dire_name,
+            res.get("predicted_team_name", rad_name), res.get("predicted_winner", "Radiant"),
+            res.get("win_probability_percent", 50), [query.message.chat.id]
+        )
+
+        await wait_msg.edit_text(card, parse_mode="HTML")
+        # Удаляем клавиатуру из сообщения с запросом
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Ошибка в cb_confirm_draft: {e}")
+        await wait_msg.edit_text(f"❌ Ошибка анализа: {e}")
+
+@dp.callback_query(F.data.startswith("skip_draft_"))
+async def cb_skip_draft(query: CallbackQuery):
+    match_id = query.data.split("_")[2]
+    await query.answer("Матч пропущен.")
+    try:
+        await query.message.edit_text(f"❌ <i>Анализ матча ID <code>{match_id}</code> пропущен пользователем.</i>", parse_mode="HTML")
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("analyze_"))
+async def cb_analyze_live(query: CallbackQuery):
+    match_id = int(query.data.split("_")[1])
+    await query.answer("Анализирую...")
+    wait_msg = await query.message.answer(f"⏳ Сбор данных и расчет коэффициентов для матча <code>{match_id}</code>...")
+
+    try:
+        match_data = ACTIVE_LIVE_MATCHES.get(match_id)
+        stratz = StratzClient()
+        if not match_data:
+            match_data = await asyncio.to_thread(stratz.get_match, match_id)
+
+        rad_name = match_data.get("radiant_name") or match_data.get("radiantTeam", {}).get("name", "Radiant")
+        dire_name = match_data.get("dire_name") or match_data.get("direTeam", {}).get("name", "Dire")
+
+        builder = MatchDossierBuilder(stratz_client=stratz)
+        dossier = await asyncio.to_thread(builder.build_match_dossier, match_data)
+        analyzer = DotaAIAnalyzer()
+        res = await asyncio.to_thread(analyzer.analyze_dossier, dossier)
+        card = format_analysis_card(match_id, res, is_live=True, rad_name=rad_name, dire_name=dire_name, tier=2)
 
         post_tracker.track_match(
             match_id, rad_name, dire_name,
@@ -238,6 +364,7 @@ async def cb_analyze_live(query: CallbackQuery):
 
         await wait_msg.edit_text(card, parse_mode="HTML")
     except Exception as e:
+        logger.error(f"Ошибка в cb_analyze_live: {e}")
         await wait_msg.edit_text(f"❌ Ошибка: {e}")
 
 @dp.message(Command("auto"))
@@ -258,65 +385,54 @@ async def toggle_auto(event: types.TelegramObject):
     else:
         await msg.answer(f"🔔 Авто-уведомления по расписанию теперь {status}.", reply_markup=get_main_keyboard(cid))
 
-@dp.message(F.text)
-async def handle_any_text(message: Message):
+@dp.message(F.text.regexp(r"^\d{9,11}$"))
+async def handle_direct_match_id(message: Message):
+    match_id = int(message.text.strip())
     add_subscriber(message.chat.id)
-    text = message.text.strip()
-    if text.isdigit() and len(text) >= 8:
-        match_id = int(text)
-        wait_msg = await message.answer(f"🔍 Загружаю матч <code>{match_id}</code> из STRATZ API...", parse_mode="HTML")
-        try:
-            stratz = StratzClient()
+    wait_msg = await message.answer(f"⏳ Сбор данных для матча <code>{match_id}</code>...")
+
+    try:
+        match_data = ACTIVE_LIVE_MATCHES.get(match_id)
+        stratz = StratzClient()
+        if not match_data:
             match_data = await asyncio.to_thread(stratz.get_match, match_id)
-            if not match_data:
-                await wait_msg.edit_text("❌ Матч с таким ID не найден в STRATZ.")
-                return
 
-            rad_name = match_data.get("radiantTeam", {}).get("name", "Radiant")
-            dire_name = match_data.get("direTeam", {}).get("name", "Dire")
+        rad_name = match_data.get("radiant_name") or match_data.get("radiantTeam", {}).get("name", "Radiant")
+        dire_name = match_data.get("dire_name") or match_data.get("direTeam", {}).get("name", "Dire")
 
-            await wait_msg.edit_text(f"📊 Анализирую игроков и драфт матча {match_id}...")
-            builder = MatchDossierBuilder(stratz_client=stratz)
-            dossier = await asyncio.to_thread(builder.build_match_dossier, match_data)
-            analyzer = DotaAIAnalyzer()
-            res = await asyncio.to_thread(analyzer.analyze_dossier, dossier)
-            card = format_analysis_card(match_id, res, is_live=False, rad_name=rad_name, dire_name=dire_name)
+        builder = MatchDossierBuilder(stratz_client=stratz)
+        dossier = await asyncio.to_thread(builder.build_match_dossier, match_data)
+        analyzer = DotaAIAnalyzer()
+        res = await asyncio.to_thread(analyzer.analyze_dossier, dossier)
+        card = format_analysis_card(match_id, res, is_live=False, rad_name=rad_name, dire_name=dire_name, tier=2)
 
-            post_tracker.track_match(
-                match_id, rad_name, dire_name,
-                res.get("predicted_team_name", rad_name), res.get("predicted_winner", "Radiant"),
-                res.get("win_probability_percent", 50), [message.chat.id]
-            )
+        post_tracker.track_match(
+            match_id, rad_name, dire_name,
+            res.get("predicted_team_name", rad_name), res.get("predicted_winner", "Radiant"),
+            res.get("win_probability_percent", 50), [message.chat.id]
+        )
 
-            await wait_msg.edit_text(card, parse_mode="HTML")
-        except Exception as e:
-            await wait_msg.edit_text(f"❌ Ошибка: {e}")
-        return
-
-    await message.answer(
-        f"Я получил ваше сообщение: <i>\"{text}\"</i>\n\n"
-        "💡 <b>Чтобы разобрать матч:</b> просто отправьте мне его <b>Match ID</b> (например, <code>9088923051</code>) "
-        "или выберите действие на кнопках ниже.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(message.chat.id)
-    )
+        await wait_msg.edit_text(card, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка в handle_direct_match_id: {e}")
+        await wait_msg.edit_text(f"❌ Ошибка анализа матча: {e}")
 
 async def background_post_match_monitor(bot: Bot):
-    """Фоновый цикл проверки результатов матчей (проверяет каждые 45 секунд)."""
+    """Фоновый воркер: проверяет завершение отслеживаемых матчей и рассылает результаты."""
     logger.info("Запущен фоновый мониторинг результатов завершенных матчей...")
     stratz = StratzClient()
-    analyzer = DotaAIAnalyzer()
+    ai = DotaAIAnalyzer()
 
     while True:
         try:
-            reports = await asyncio.to_thread(post_tracker.check_finished_matches, stratz, analyzer)
-            for r in reports:
-                card_text = r["message_text"]
-                chat_ids = r.get("chat_ids") or list(get_subscribers())
-                for cid in chat_ids:
+            finished = await asyncio.to_thread(post_tracker.check_finished_matches, stratz, ai)
+            for item in finished:
+                card = item["message_text"]
+                cids = item["chat_ids"]
+                logger.info(f"Матч {item['match_id']} завершен! Рассылаем результаты {len(cids)} подписчикам.")
+                for cid in cids:
                     try:
-                        await bot.send_message(cid, card_text, parse_mode="HTML")
-                        logger.info(f"Отчет об исходе матча {r['match_id']} успешно доставлен {cid}!")
+                        await bot.send_message(cid, card, parse_mode="HTML")
                     except Exception as send_err:
                         logger.error(f"Не удалось отправить результат матча {cid}: {send_err}")
         except Exception as e:
@@ -324,83 +440,113 @@ async def background_post_match_monitor(bot: Bot):
         await asyncio.sleep(45)
 
 async def smart_schedule_scheduler(bot: Bot):
+    """
+    Фоновый планировщик расписания:
+    - Tier-1: автоматический анализ драфта и отправка полной сводки.
+    - Tier-2 / Tier-3: интерактивный запрос подписчикам с кнопками [🎯 Анализировать] [❌ Пропустить].
+    """
     logger.info("Фоновый планировщик расписания активен.")
-    notified_match_ids = set()
+    stratz = StratzClient()
 
     while True:
         try:
-            upcoming = await asyncio.to_thread(LiquipediaScheduleFetcher.get_upcoming_matches, 3)
-            if not upcoming:
-                await asyncio.sleep(600)
-                continue
+            # 1. Получаем расписание предстоящих игр
+            upcoming = await asyncio.to_thread(LiquipediaScheduleFetcher.get_upcoming_matches, 8)
 
-            next_match = upcoming[0]
-            starts_in_sec = next_match["starts_in_seconds"]
+            # 2. Получаем текущие live матчи
+            live_matches = await asyncio.to_thread(LiveMatchTracker.get_live_matches, stratz)
 
-            # Если до матча больше 5 минут, ждем
-            if starts_in_sec > 300:
-                sleep_duration = starts_in_sec - 300
-                logger.info(
-                    f"Следующий матч по расписанию: {next_match['team1']} vs {next_match['team2']} "
-                    f"через {round(starts_in_sec / 60, 1)} мин."
+            # Обновляем кэш live матчей
+            for m in live_matches:
+                ACTIVE_LIVE_MATCHES[m["match_id"]] = m
+
+            tournament_live = [m for m in live_matches if m["match_type"] == "tournament"]
+
+            for lm in tournament_live:
+                mid = lm["match_id"]
+                if mid in HANDLED_MATCH_IDS:
+                    continue
+
+                # Проверяем, завершился ли драфт (все 10 героев выбраны)
+                if not lm["draft_complete"]:
+                    continue
+
+                rad_name = lm["radiant_name"]
+                dire_name = lm["dire_name"]
+
+                # Ищем соответствие в расписании Liquipedia для определения Tier
+                matched_scheduled = LiveMatchTracker.find_match_by_teams(
+                    [rad_name], [dire_name],
+                    [{"radiant_name": u["team1"], "dire_name": u["team2"], "tier": u["tier"], "tournament": u["tournament"]} for u in upcoming]
                 )
-                while sleep_duration > 0:
-                    chunk = min(sleep_duration, 180)
-                    await asyncio.sleep(chunk)
-                    sleep_duration -= chunk
 
-            logger.info(f"Матч {next_match['team1']} vs {next_match['team2']} ожидается! Начинаем отслеживать драфт...")
-            stratz = StratzClient()
-            draft_found = False
-            # Проверяем лобби в течение 45 минут (на случай задержек матча)
-            check_attempts = 90  # 90 * 30 сек = 45 мин
+                if matched_scheduled:
+                    tier = matched_scheduled.get("tier", 2)
+                    tour_name = matched_scheduled.get("tournament", "Pro Tournament")
+                else:
+                    # Эвристика по ключевым словам турнира / команд
+                    tier = LiquipediaScheduleFetcher.get_tournament_tier(rad_name + " " + dire_name, rad_name + " " + dire_name)
+                    tour_name = "Tournament Match"
 
-            while check_attempts > 0 and not draft_found:
-                check_attempts -= 1
-                live_matches = await asyncio.to_thread(stratz.get_live_matches, 50)
+                HANDLED_MATCH_IDS.add(mid)
 
-                for m in live_matches:
-                    match_id = m.get("matchId")
-                    if not match_id or match_id in notified_match_ids:
-                        continue
+                subscribers = list(get_subscribers())
+                if not subscribers:
+                    continue
 
-                    players = m.get("players", [])
-                    picked_heroes = [p for p in players if p.get("heroId")]
+                if tier == 1:
+                    # TIER-1: ПОЛНОСТЬЮ АВТОМАТИЧЕСКИЙ АНАЛИЗ
+                    logger.info(f"🏆 Tier-1 матч {mid} ({rad_name} vs {dire_name}) обнаружен! Запуск авто-анализа...")
+                    builder = MatchDossierBuilder(stratz_client=stratz)
+                    dossier = await asyncio.to_thread(builder.build_match_dossier, lm)
+                    analyzer = DotaAIAnalyzer()
+                    res = await asyncio.to_thread(analyzer.analyze_dossier, dossier)
+                    card = format_analysis_card(mid, res, is_live=True, rad_name=rad_name, dire_name=dire_name, tier=1)
 
-                    if len(picked_heroes) == 10:
-                        rad_name = m.get("radiantTeam", {}).get("name", "Radiant")
-                        dire_name = m.get("direTeam", {}).get("name", "Dire")
-                        logger.info(f"Драфт матча {match_id} ({rad_name} vs {dire_name}) завершен! Запуск анализа...")
-                        notified_match_ids.add(match_id)
-                        draft_found = True
+                    for chat_id in subscribers:
+                        try:
+                            await bot.send_message(chat_id, card, parse_mode="HTML")
+                        except Exception as send_err:
+                            logger.error(f"Не удалось отправить уведомление {chat_id}: {send_err}")
 
-                        builder = MatchDossierBuilder(stratz_client=stratz)
-                        dossier = await asyncio.to_thread(builder.build_match_dossier, m)
-                        analyzer = DotaAIAnalyzer()
-                        res = await asyncio.to_thread(analyzer.analyze_dossier, dossier)
-                        card = format_analysis_card(match_id, res, is_live=True, rad_name=rad_name, dire_name=dire_name)
+                    post_tracker.track_match(
+                        mid, rad_name, dire_name,
+                        res.get("predicted_team_name", rad_name), res.get("predicted_winner", "Radiant"),
+                        res.get("win_probability_percent", 50), subscribers
+                    )
 
-                        subscribers = list(get_subscribers())
-                        for chat_id in subscribers:
-                            try:
-                                await bot.send_message(chat_id, card, parse_mode="HTML")
-                            except Exception as send_err:
-                                logger.error(f"Не удалось отправить уведомление {chat_id}: {send_err}")
+                else:
+                    # TIER-2 / TIER-3: ИНТЕРАКТИВНЫЙ ЗАПРОС С КНОПКАМИ ПОДТВЕРЖДЕНИЯ
+                    logger.info(f"🥈🥉 Tier-{tier} матч {mid} ({rad_name} vs {dire_name}) на стадии драфта. Отправляем запрос...")
+                    PENDING_DRAFT_MATCHES[mid] = lm
 
-                        # Регистрируем в трекер исходов матча
-                        post_tracker.track_match(
-                            match_id, rad_name, dire_name,
-                            res.get("predicted_team_name", rad_name), res.get("predicted_winner", "Radiant"),
-                            res.get("win_probability_percent", 50), subscribers
-                        )
-                        break
+                    tier_badge = "🥈 [Tier 2]" if tier == 2 else "🥉 [Tier 3]"
+                    prompt_text = (
+                        f"⚔️ <b>Начался драфт матча!</b> {tier_badge}\n\n"
+                        f"🏆 Турнир: <b>{tour_name}</b>\n"
+                        f"🆚 <b>{rad_name}</b> vs <b>{dire_name}</b>\n"
+                        f"🆔 Match ID: <code>{mid}</code>\n\n"
+                        f"<i>Желаете запустить глубокий AI-анализ драфта и расчет коэффициентов?</i>"
+                    )
 
-                if not draft_found:
-                    await asyncio.sleep(30)
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="🎯 Анализировать драфт", callback_data=f"confirm_draft_{mid}"),
+                            InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip_draft_{mid}")
+                        ]
+                    ])
+
+                    for chat_id in subscribers:
+                        try:
+                            await bot.send_message(chat_id, prompt_text, parse_mode="HTML", reply_markup=kb)
+                        except Exception as send_err:
+                            logger.error(f"Не удалось отправить запрос {chat_id}: {send_err}")
 
         except Exception as e:
-            logger.error(f"Ошибка в планировщике: {e}")
-            await asyncio.sleep(60)
+            logger.error(f"Ошибка в smart_schedule_scheduler: {e}")
+
+        # Проверяем каждые 35 секунд
+        await asyncio.sleep(35)
 
 async def main():
     await start_health_server()
@@ -419,9 +565,7 @@ async def main():
         return
 
     # Запускаем фоновые задачи:
-    # 1. Отслеживание расписания и драфтов до игры
     asyncio.create_task(smart_schedule_scheduler(bot))
-    # 2. Отслеживание результатов завершенных матчей после игры
     asyncio.create_task(background_post_match_monitor(bot))
 
     await dp.start_polling(bot)

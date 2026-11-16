@@ -1,5 +1,6 @@
 import json
 import logging
+import requests
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from hero_helper import get_hero_name
@@ -56,11 +57,58 @@ class PostMatchTracker:
         for match_id_str, meta in active.items():
             match_id = int(match_id_str)
             try:
-                m = stratz_client.get_match(match_id)
-                duration = m.get("durationSeconds", 0)
-                did_rad_win = m.get("didRadiantWin")
+                duration = 0
+                did_rad_win = None
+                rad_kills = 0
+                dire_kills = 0
+                top_name = "MVP Игрок"
+                top_hero = "Герой"
+                top_kda = "10/2/15"
+                top_imp = 0
 
-                # Матч завершен, если известна длительность > 0 и есть флаг победы
+                # 1. Проверяем через STRATZ
+                try:
+                    m = stratz_client.get_match(match_id)
+                    duration = m.get("durationSeconds", 0) or 0
+                    did_rad_win = m.get("didRadiantWin")
+                    rad_kills = m.get("radiantKills", 0) or 0
+                    dire_kills = m.get("direKills", 0) or 0
+
+                    players = m.get("players", [])
+                    winner_players = [p for p in players if p.get("isRadiant") == did_rad_win]
+                    winner_players.sort(key=lambda p: (p.get("imp", 0) or 0, p.get("kills", 0) or 0), reverse=True)
+                    if winner_players:
+                        tp = winner_players[0]
+                        top_name = (tp.get("steamAccount", {}).get("proSteamAccount", {}).get("name") or 
+                                    tp.get("steamAccount", {}).get("name") or "Player")
+                        top_hero = get_hero_name(tp.get("heroId", 0))
+                        top_kda = f"{tp.get('kills', 0)}/{tp.get('deaths', 0)}/{tp.get('assists', 0)}"
+                        top_imp = tp.get("imp", 0) or 0
+                except Exception as stratz_err:
+                    logger.debug(f"STRATZ get_match({match_id}) exception: {stratz_err}")
+
+                # 2. Если STRATZ еще не обновил матч, проверяем OpenDota
+                if not duration or did_rad_win is None:
+                    try:
+                        r = requests.get(f"https://api.opendota.com/api/matches/{match_id}", timeout=6)
+                        if r.status_code == 200:
+                            od = r.json()
+                            duration = od.get("duration", 0) or 0
+                            did_rad_win = od.get("radiant_win")
+                            rad_kills = od.get("radiant_score", 0) or 0
+                            dire_kills = od.get("dire_score", 0) or 0
+                            od_players = od.get("players", [])
+                            w_players = [p for p in od_players if p.get("isRadiant") == did_rad_win]
+                            w_players.sort(key=lambda p: (p.get("kills", 0) or 0), reverse=True)
+                            if w_players:
+                                tp = w_players[0]
+                                top_name = tp.get("personaname") or tp.get("name") or "MVP"
+                                top_hero = get_hero_name(tp.get("hero_id", 0))
+                                top_kda = f"{tp.get('kills', 0)}/{tp.get('deaths', 0)}/{tp.get('assists', 0)}"
+                    except Exception:
+                        pass
+
+                # Матч завершен, если известна длительность > 600 сек (10 мин) и определен победитель
                 if duration and duration > 600 and did_rad_win is not None:
                     rad_name = meta["radiant_name"]
                     dire_name = meta["dire_name"]
@@ -70,29 +118,15 @@ class PostMatchTracker:
                     predicted_side = meta["predicted_side"]
                     is_correct = (predicted_side.lower() == actual_winner_side.lower())
 
-                    # Игровая статистика
                     mins = duration // 60
                     secs = duration % 60
                     time_str = f"{mins}:{secs:02d}"
-                    rad_kills = m.get("radiantKills", 0)
-                    dire_kills = m.get("direKills", 0)
-
-                    # Выделяем ключевого игрока (MVP по IMP или фрагам)
-                    players = m.get("players", [])
-                    winner_players = [p for p in players if p.get("isRadiant") == did_rad_win]
-                    winner_players.sort(key=lambda p: (p.get("imp", 0) or 0, p.get("kills", 0) or 0), reverse=True)
-                    top_player = winner_players[0] if winner_players else {}
-
-                    top_name = (top_player.get("steamAccount", {}).get("proSteamAccount", {}).get("name") or 
-                                top_player.get("steamAccount", {}).get("name") or "Player")
-                    top_hero = get_hero_name(top_player.get("heroId", 0))
-                    top_kda = f"{top_player.get('kills', 0)}/{top_player.get('deaths', 0)}/{top_player.get('assists', 0)}"
 
                     # Тактическое объяснение исхода
                     if is_correct:
                         why_text = (
                             f"Команда <b>{actual_winner_name}</b> уверенно реализовала преимущество драфта и тайминги силы. "
-                            f"Ключевой вклад внес <b>{top_name}</b> на <b>{top_hero}</b> (KDA: {top_kda}, рейтинг IMP: +{top_player.get('imp', 0)}), "
+                            f"Ключевой вклад внес <b>{top_name}</b> на <b>{top_hero}</b> (KDA: {top_kda}, рейтинг IMP: +{top_imp}), "
                             f"захватив карту и выиграв ключевые командные сражения."
                         )
                     else:
